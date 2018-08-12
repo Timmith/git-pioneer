@@ -1,20 +1,21 @@
-var three = require('three');
-var CheckerboardTexture = require('threejs-texture-checkerboard');
-var cannon = require('cannon');
-var urlParam = require('urlparam');
-var clamp = require('clamp');
-var Signal = require('signals').Signal;
-var Player = require('./Player');
+var three = require("three");
+var CheckerboardTexture = require("threejs-texture-checkerboard");
+var cannon = require("cannon");
+var urlParam = require("urlparam");
+var OrbittingBalls = require("threejs-orbitingballs");
 
-var tools = require('gameObjects/tools');
-var effects = require('gameObjects/effects');
-var Portal = require('gameObjects/Portal');
+var tools = require("gameObjects/tools");
+var effects = require("gameObjects/effects");
 
-var geomLib = require('geometry/lib');
-var CollisionLayers = require('CollisionLayers');
+var geomLib = require("geometry/lib");
+var matLib = require("materials/lib");
+var CollisionLayers = require("CollisionLayers");
 
-function WorldManager(canvas, scene, camera, inputManager) {
-	var fog = new THREE.Fog( 0x7f7f7f, camera.near, camera.far);
+function WorldManager(canvas, scene, camera, inputManager, renderer) {
+	var fog = new three.Fog( 0x7f7f7f, camera.near, camera.far);
+	var physicsDebugScene = new three.Scene();
+	physicsDebugScene.name = "debugPhysics" + Math.random();
+
 	scene.fog = fog;
 
 	var planeMaterial = new three.MeshPhongMaterial({
@@ -40,9 +41,9 @@ function WorldManager(canvas, scene, camera, inputManager) {
 	scene.add(ambient);
 
 	var groundBody = new cannon.Body({
-			mass: 0, // mass == 0 makes the body static
-			collisionFilterGroup: CollisionLayers.ENVIRONMENT,
-			collisionFilterMask: CollisionLayers.PLAYER | CollisionLayers.ITEMS | CollisionLayers.PORTALS
+		mass: 0, // mass == 0 makes the body static
+		collisionFilterGroup: CollisionLayers.ENVIRONMENT,
+		collisionFilterMask: CollisionLayers.PLAYER | CollisionLayers.ITEMS | CollisionLayers.PORTALS
 	});
 	var groundShape = new cannon.Plane();
 
@@ -55,21 +56,40 @@ function WorldManager(canvas, scene, camera, inputManager) {
 
 	function add(object) {
 		scene.add(object.mesh);
-		if(object.body) world.addBody(object.body);
+		if(object.body) {
+			world.addBody(object.body);
+			var color = new three.Color();
+			color.setHSL(Math.random(), 1, 0.8);
+			object.body.shapes.forEach(shape => {
+				if(!shape.debugMesh) {
+					var geom = geomLib.sphereHelper(1, 16);
+					var mat = new three.LineBasicMaterial({
+						color: color
+					});
+					var mesh = new three.Line(geom, mat);
+					mesh.matrixAutoUpdate = false;
+					shape.debugMesh = mesh;
+				}
+				physicsDebugScene.add(shape.debugMesh);
+			});
+		}
 		objects.push(object);
 	}
 	var queueToRemove = [];
-	function requestRemove(object, callback) {
-		queueToRemove.push([object, callback]);
+	function requestRemove(object, callback, immediate = false) {
+		if(immediate) {
+			remove(object, callback);
+		} else {
+			queueToRemove.push([object, callback]);
+		}
 	}
 	function requestDestroy(object, callback) {
 		if(object && object.body) {
-			with(object.body) {
-				for(var i = 0; i < shapes.length; i++) {
-					var shape = shapes[i];
-					if(shape.radius > 0) {
-						makeHitEffect(pointToWorldFrame(shapeOffsets[i]), shape.radius, 0.5);
-					}
+			var shapes = object.body.shapes;
+			for(var i = 0; i < shapes.length; i++) {
+				var shape = shapes[i];
+				if(shape.radius > 0) {
+					makeHitEffect(object.body.pointToWorldFrame(object.body.shapeOffsets[i]), shape.radius, 0.5);
 				}
 			}
 		}
@@ -77,7 +97,13 @@ function WorldManager(canvas, scene, camera, inputManager) {
 	}
 	function remove(object, callback) {
 		scene.remove(object.mesh);
-		if(object.body) world.removeBody(object.body);
+		if(object.body) {
+			object.body.shapes.forEach(shape => {
+				physicsDebugScene.remove(shape.debugMesh);
+			});
+
+			world.removeBody(object.body);
+		}
 		var index = objects.indexOf(object);
 		if(index != -1) {
 			objects.splice(index, 1);
@@ -85,29 +111,10 @@ function WorldManager(canvas, scene, camera, inputManager) {
 		if(callback) callback();
 	}
 
-	var player;
-	var _this = this;
-	function enablePlayer(oldPlayer) {
-		player = new Player(scene, camera, canvas, inputManager, _this);
-		player.homeWorld = _this;
-		player.name = "player in " + _this.name;
-		if(oldPlayer) {
-			player.copy(oldPlayer);
-		}
-		add(player);
-	}
-	function disablePlayer() {
-		if(!player) return;
-		scene.add(camera);
-		remove(player);
-		player.onDestroy();
-		player = null;
-	}
-
 
 	var fixedTimeStep = 1.0 / 60.0; // seconds 
 	var maxSubSteps = 3;
-	 
+	
 	var radius = 0.5; // m 
 	var geometry = geomLib.sphere(radius, 32, 16);
 
@@ -152,36 +159,53 @@ function WorldManager(canvas, scene, camera, inputManager) {
 		add(hit);
 	}
 
-	function weaponFireMakeBall(pos, playerSize) {
-		makeBall(pos.x, pos.y, pos.z, playerSize);
-	}
-
-	// player.addTool({
+	// userHead.addTool({
 	// 	primaryFireStart: weaponFireMakeBall
 	// });
 
 	var i = 0;
 	for(var tool in tools){
-		add(new tools[tool](this, new cannon.Vec3(i, -6, 1)));
+		add(new tools[tool](new cannon.Vec3(i, -6 + Math.random(), 1)));
 		i += 2;
 	}
-
-	var portal = new Portal(this, new cannon.Vec3(0, 1, 1));
-	add(portal);
 
 
 	// Start the simulation loop 
 	var lastTime;
-	function simloop(time){
-		requestAnimationFrame(simloop);
+	var timeScale;
+	function simulatePhysics(time){
+		var i;
 		if(lastTime === undefined){
 			lastTime = time;
 		}
 		var dt = (time - lastTime) * 0.001;
+		timeScale = Math.min(1 / ((1/60) / dt), 10);
+		for(i = 0; i < objects.length; i++) {
+			var object = objects[i];
+			if(object.onUpdateSim) object.onUpdateSim(timeScale);
+		}
 		if(dt > 0) {
 			world.step(fixedTimeStep, dt, maxSubSteps);
 		}
-		var timeScale = (1/60) / dt;
+		if(queueToRemove.length > 0) {
+			for(i = 0; i < queueToRemove.length; i++) {
+				remove(queueToRemove[i][0], queueToRemove[i][1]);
+			}
+			queueToRemove.length = 0;
+		}
+		lastTime = time;
+	}
+
+	var mat = matLib.checkerboards.red();
+	var orbittingballsPivot = new three.Object3D();
+	var orbittingballs = new OrbittingBalls(~~(Math.random() * 100), mat);
+	orbittingballsPivot.position.set(Math.random() * 20 - 10, 0, 1.5);
+	orbittingballsPivot.scale.set(0.2, 0.2, 0.2);
+	orbittingballsPivot.add(orbittingballs);
+	scene.add(orbittingballsPivot);
+
+	function onEnterFrame() {
+		orbittingballs.onEnterFrame();
 		for(var i = 0; i < objects.length; i++) {
 			var object = objects[i];
 			if(object.body) {
@@ -189,25 +213,30 @@ function WorldManager(canvas, scene, camera, inputManager) {
 				object.mesh.quaternion.copy(object.body.quaternion);
 			}
 			if(object.onEnterFrame) object.onEnterFrame(timeScale);
-			if(object.onUpdateSim) object.onUpdateSim();
 		}
-		if(queueToRemove.length > 0) {
-			for(var i = 0; i < queueToRemove.length; i++) {
-				remove(queueToRemove[i][0], queueToRemove[i][1]);
-			}
-			queueToRemove.length = 0;
-		}
-		lastTime = time;
-	};
+	}
 
-	this.portal = portal;
-	Object.defineProperty(this, "player", {
-		get: function() { return player; }, 
-		set: function(value) { player = value; } 
-	})
-	this.enablePlayer = enablePlayer;
-	this.disablePlayer = disablePlayer;
+	var size = new three.Vector3(1, 1, 1);
+	var debugPhysics = urlParam("debugPhysics", false);
+	function onExitFrame() {
+		if(!debugPhysics) return;
+		world.bodies.forEach(body => {
+			body.shapes.forEach((shape, i) => {
+				if(shape.debugMesh) {
+					var r = shape.radius;
+					size.set(r, r, r);
+					shape.debugMesh.matrix.compose(body.position.toThree(), body.quaternion.toThree(), size);
+					var offsetMatrix = new three.Matrix4();
+					var offset = body.shapeOffsets[i];
+					offsetMatrix.makeTranslation(offset.x, offset.y, offset.z);
+					shape.debugMesh.matrix.multiply(offsetMatrix);
+				}
+			});
+		});
+		renderer.render(physicsDebugScene, camera);
+	}
 
+	
 	this.world = world;
 	this.scene = scene;
 
@@ -217,7 +246,9 @@ function WorldManager(canvas, scene, camera, inputManager) {
 	this.destroy = requestDestroy.bind(this);
 	this.makeBall = makeBall.bind(this);
 	this.makeHitEffect = makeHitEffect.bind(this);
-	requestAnimationFrame(simloop);
+	this.onEnterFrame = onEnterFrame.bind(this);
+	this.simulatePhysics = simulatePhysics.bind(this);
+	this.onExitFrame = onExitFrame.bind(this);
 }
 
 module.exports = WorldManager;
